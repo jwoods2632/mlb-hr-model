@@ -26,6 +26,7 @@ import pandas as pd
 import streamlit as st
 
 import mlb_hr_core as core
+import mlb_hr_report
 
 st.set_page_config(page_title="MLB HR Candidate Model", page_icon="⚾", layout="wide")
 
@@ -152,13 +153,28 @@ if "results" in st.session_state:
         note_cols = ["batter", "pitcher", "PW_note", "MU_note", "FM_note", "BvP_note"]
         st.dataframe(results[note_cols], use_container_width=True, hide_index=True)
 
+    st.divider()
+    st.subheader("Visual report, by game")
+    report_html = mlb_hr_report.generate_html_report(results.copy(), date_str, weights=weights)
+    import streamlit.components.v1 as components
+    components.html(report_html, height=800, scrolling=True)
+
     csv_bytes = results.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download full CSV",
-        data=csv_bytes,
-        file_name=f"hr_candidates_{date_str}.csv",
-        mime="text/csv",
-    )
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            "Download CSV",
+            data=csv_bytes,
+            file_name=f"hr_candidates_{date_str}.csv",
+            mime="text/csv",
+        )
+    with dl_col2:
+        st.download_button(
+            "Download visual report (HTML)",
+            data=report_html.encode("utf-8"),
+            file_name=f"hr_report_{date_str}.html",
+            mime="text/html",
+        )
 
     st.caption(
         "Reminder: rain/delay risk isn't modeled numerically here — worth a quick manual check "
