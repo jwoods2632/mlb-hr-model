@@ -348,6 +348,32 @@ def get_rotowire_projected_lineups(target_date: str = None) -> list:
 _batter_df_cache = {}
 _pitcher_df_cache = {}
 
+# Raw Statcast pulls return 90+ columns per pitch (pitch type, spin rate,
+# release point, etc.) -- this model only ever touches these. Trimming
+# immediately after each fetch, before caching, cuts memory per dataframe
+# by roughly an order of magnitude, which matters a lot when holding many
+# batters'/pitchers' data at once (this was the main driver of the
+# out-of-memory crash on Streamlit Cloud's free tier).
+_BATTER_COLS = ["game_date", "events", "launch_speed", "launch_angle", "p_throws", "pitcher"]
+_PITCHER_COLS = ["events", "launch_speed", "launch_angle", "stand"]
+
+
+def _trim_and_shrink(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """Keep only needed columns and downcast dtypes to reduce memory use."""
+    if df is None or df.empty:
+        return df
+    keep = [c for c in cols if c in df.columns]
+    df = df[keep].copy()
+    for c in ("events", "p_throws", "stand"):
+        if c in df.columns:
+            df[c] = df[c].astype("category")
+    for c in ("launch_speed", "launch_angle"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+    if "pitcher" in df.columns:
+        df["pitcher"] = pd.to_numeric(df["pitcher"], errors="coerce").astype("Int32")
+    return df
+
 
 def _get_batter_statcast(batter_id: int) -> pd.DataFrame:
     """
@@ -358,6 +384,8 @@ def _get_batter_statcast(batter_id: int) -> pd.DataFrame:
     single biggest speed fix -- previously each batter triggered 3
     separate downloads of increasingly-overlapping date ranges; now it's
     1 download, filtered locally in pandas (fast, no network) 3 ways.
+    Trimmed to only the columns actually used (see _BATTER_COLS) to keep
+    memory reasonable across an entire slate's worth of batters.
     """
     if batter_id in _batter_df_cache:
         return _batter_df_cache[batter_id]
@@ -367,6 +395,7 @@ def _get_batter_statcast(batter_id: int) -> pd.DataFrame:
         df = pd.DataFrame()
     if df is not None and not df.empty and "game_date" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_date"])
+    df = _trim_and_shrink(df, _BATTER_COLS)
     _batter_df_cache[batter_id] = df
     return df
 
@@ -377,7 +406,8 @@ def _get_pitcher_statcast(pitcher_id: int) -> pd.DataFrame:
     big fix: every batter facing the same starter was triggering its own
     fresh season-long pull of that pitcher's data -- 9+ redundant
     downloads of identical data per game. Now it's 1 per pitcher, reused
-    across every batter who faces them.
+    across every batter who faces them. Also trimmed to only the columns
+    actually used (see _PITCHER_COLS).
     """
     if pitcher_id in _pitcher_df_cache:
         return _pitcher_df_cache[pitcher_id]
@@ -386,8 +416,25 @@ def _get_pitcher_statcast(pitcher_id: int) -> pd.DataFrame:
         df = statcast_pitcher(season_start, date.today().strftime("%Y-%m-%d"), pitcher_id)
     except Exception:
         df = pd.DataFrame()
+    df = _trim_and_shrink(df, _PITCHER_COLS)
     _pitcher_df_cache[pitcher_id] = df
     return df
+
+
+def _release_batter_cache(batter_id: int):
+    """Evict a batter's cached data once we're fully done scoring them --
+    unlike pitchers (shared across ~9 batters per game), each batter is
+    normally only scored once per run, so there's no reuse benefit to
+    keeping their data around afterward. This bounds peak memory to
+    roughly 'one batter + all pitchers seen so far' instead of 'every
+    batter + every pitcher, all at once' by the end of a full slate."""
+    _batter_df_cache.pop(batter_id, None)
+
+
+def _release_pitcher_cache(pitcher_id: int):
+    """Evict a pitcher's cached data once every batter facing them this
+    run has been scored."""
+    _pitcher_df_cache.pop(pitcher_id, None)
 
 
 def score_form(batter_id: int, days: int = 14) -> tuple:
@@ -703,6 +750,17 @@ def build_candidates(target_date: str, owm_key: str = None, progress_callback=No
                     "BvP": bvp_score,
                     "BvP_note": bvp_note,
                 })
+
+                # Free this batter's data now -- unlike pitchers, each batter
+                # is normally only used once per run, so there's no reuse
+                # benefit to keeping it cached. This keeps peak memory from
+                # growing across an entire slate (the actual cause of the
+                # out-of-memory crash on Streamlit Cloud's free tier).
+                _release_batter_cache(batter_id)
+
+            # Done with every batter facing this pitcher for this game --
+            # safe to free their cached data too.
+            _release_pitcher_cache(opp_pitcher_id)
 
     if not results:
         report("No candidates scored -- no confirmed or projected lineups available yet.")
